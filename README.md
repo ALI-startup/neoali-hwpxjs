@@ -9,5 +9,4 @@ A fork of @ssabrojs/hwpxjs ([link](https://github.com/ssabro/hwpxjs)) with impro
 
 ## Usage
 ```js
-import { convert } from 'neoali-hwpxjs'
-// const { HwpxReader } = await import("neoali-hwpxjs");
+const { HwpxReader } = await import("neoali-hwpxjs");

@@ -50,6 +50,10 @@ export class HwpxReader {
     encryptedCache = null;
     characterProperties = new Map();
     fontFaces = new Map();
+    // NEW: Add maps for paragraph properties and numberings
+    paragraphProperties = new Map();
+    numberings = new Map();
+    
     async loadFromArrayBuffer(buffer) {
         const zip = await JSZip.loadAsync(buffer);
         this.zip = zip;
@@ -388,6 +392,63 @@ export class HwpxReader {
             return value === undefined || value === null ? '' : String(value);
         });
     }
+    
+    // NEW: Get bullet or numbering text and indentation for a paragraph
+    getBulletInfo(p, numberingCounters) {
+        const paraPrIDRef = p?.["@paraPrIDRef"];
+        if (!paraPrIDRef) return null;
+        
+        const paraPr = this.paragraphProperties.get(paraPrIDRef);
+        if (!paraPr) return null;
+        
+        const heading = paraPr.heading;
+        if (!heading || heading.type !== "NUMBER") return null;
+        
+        const numberingId = heading.idRef;
+        const level = heading.level || 0;
+        
+        const numbering = this.numberings.get(numberingId);
+        if (!numbering) return null;
+        
+        // Get the paraHead for the specified level
+        const paraHeads = numbering.paraHeads || [];
+        const paraHead = paraHeads[level];
+        if (!paraHead) return null;
+        
+        // Get indentation from paragraph properties
+        const indent = paraPr.indent || {};
+        const indentValue = indent.intent || 0;
+        const leftValue = indent.left || 0;
+        
+        // Process bullet/number text
+        let bulletText = paraHead.text || "";
+        
+        // Handle ^N placeholder format - replace with actual counter
+        if (/^\^(\d+)\.?$/.test(bulletText)) {
+            // This is a numbered format like ^1.
+            const key = `${numberingId}-${level}`;
+            
+            // Initialize counter if needed
+            if (!numberingCounters[key]) {
+                numberingCounters[key] = 1;
+            }
+            
+            // Replace ^N with actual number
+            bulletText = bulletText.replace(/^\^(\d+)(\.?)$/, (match, num, dot) => {
+                return `${numberingCounters[key]}${dot}`;
+            });
+            
+            // Increment counter for next use
+            numberingCounters[key]++;
+        }
+        
+        return {
+            text: bulletText,
+            indent: indentValue,
+            leftMargin: leftValue
+        };
+    }
+    
     async extractHtml(options) {
         if (!this.zip)
             throw new HwpxNotLoadedError();
@@ -399,6 +460,10 @@ export class HwpxReader {
         const enableImages = options?.renderImages ?? true;
         const enableTables = options?.renderTables ?? true;
         const enableStyles = options?.renderStyles ?? true;
+        
+        // NEW: Track numbering counters for ^1, ^2, etc. formats
+        const numberingCounters = {};
+        
         let sectionPaths = this.getSectionPathsBySpine() ?? Object.keys(this.files)
             .filter((p) => /^contents\/section\d+\.xml$/.test(p.toLowerCase()))
             .sort((a, b) => {
@@ -437,10 +502,32 @@ export class HwpxReader {
             if (ps) {
                 const paras = Array.isArray(ps) ? ps : [ps];
                 for (const p of paras) {
+                    // NEW: Check for bullet/numbering with indentation
+                    const bulletInfo = this.getBulletInfo(p, numberingCounters);
                     const inner = this.renderNodeToHtml(p, { enableImages, enableStyles }, options);
                     const alignStyle = this.getAlignStyle(p);
-                    const styleAttr = alignStyle ? ` style="${alignStyle}"` : "";
-                    pieces.push(`<${paragraphTag}${styleAttr}>${inner}</${paragraphTag}>`);
+                    
+                    // Build style attribute with indentation
+                    const styles = [];
+                    if (alignStyle) styles.push(alignStyle);
+                    
+                    if (bulletInfo) {
+                        // Convert HWPUNIT to points (1000 HWPUNIT ≈ 10pt)
+                        const leftMarginPt = Math.round(bulletInfo.leftMargin / 100);
+                        // const indentPt = Math.round(bulletInfo.indent / 100);
+                        
+                        // For visible bullet indentation: just use padding-left
+                        // Don't use negative text-indent as it cancels out the visual spacing
+                        if (leftMarginPt > 0) {
+                            styles.push(`padding-left:${leftMarginPt}pt`);
+                        }
+                    }
+                    
+                    const styleAttr = styles.length > 0 ? ` style="${styles.join(';')}"` : "";
+                    
+                    // If there's a bullet, prepend it to the content
+                    const content = bulletInfo ? `${bulletInfo.text} ${inner}` : inner;
+                    pieces.push(`<${paragraphTag}${styleAttr}>${content}</${paragraphTag}>`);
                 }
             }
             // minimal tables: hp:tbl > hp:tr > hp:tc (cells)
@@ -598,82 +685,65 @@ export class HwpxReader {
         
         // Image (simplified): hp:picture or hp:img-like reference to BinData
         if (flags.enableImages) {
-            const binRef = this.findBinRefInRun(run);
-            if (typeof binRef === "string") {
-                // Resolve binaryItemIDRef through manifest if needed
-                const binPath = this.resolveBinaryPath(binRef);
-                if (binPath) {
-                    let src;
-                    if (options?.embedImages) {
-                        const data = this.files[binPath];
-                        if (data) {
-                            const mime = this.detectMimeType(binPath);
-                            const b64 = this.toBase64(data);
-                            src = `data:${mime};base64,${b64}`;
-                        }
-                        else {
-                            src = binPath;
-                        }
-                    }
-                    else if (options?.imageSrcResolver) {
-                        src = options.imageSrcResolver(binPath);
-                    }
-                    else {
-                        src = binPath;
-                    }
-                    html += `<img src="${this.escapeHtml(src)}" alt="" />`;
+            const pic = run?.picture ?? run?.["hp:picture"];
+            const draw = run?.drawObject ?? run?.["hp:drawObject"];
+            const img = run?.img ?? run?.["hp:img"];
+            const hcImg = run?.["hc:img"];
+            const binRef = this.getBinaryRefFromObject(pic, draw, img, hcImg);
+            if (binRef) {
+                const imgPath = this.resolveBinaryPath(binRef);
+                const imgBytes = this.files[imgPath];
+                if (imgBytes) {
+                    const mime = this.detectMimeType(imgPath);
+                    const b64 = this.toBase64(imgBytes);
+                    html += `<img src="data:${mime};base64,${b64}" alt="Image" style="max-width:100%;"/>`;
                 }
             }
         }
-        // Styles: Resolve charPrIDRef to actual character properties
+        // Apply character style
         if (flags.enableStyles) {
-            const charPrId = run?.["@charPrIDRef"];
-            if (charPrId && this.characterProperties.has(charPrId)) {
-                const charProps = this.characterProperties.get(charPrId);
-                let open = "";
-                let close = "";
-                const styleParts = [];
-                // Apply formatting
-                if (charProps?.bold) {
-                    open += "<strong>";
-                    close = "</strong>" + close;
-                }
-                if (charProps?.italic) {
-                    open += "<em>";
-                    close = "</em>" + close;
-                }
-                // Handle underline
-                if (charProps?.underline && charProps.underline?.["@type"] !== "NONE") {
-                    styleParts.push("text-decoration:underline");
-                }
-                // Handle color
-                if (charProps?.textColor && charProps.textColor !== "#000000") {
-                    styleParts.push(`color:${this.normalizeColor(charProps.textColor)}`);
-                }
-                // Handle font size (convert HWPUNIT to points)
-                if (charProps?.height) {
-                    const sizeInPt = this.convertHwpUnitToPoints(charProps.height);
-                    styleParts.push(`font-size:${sizeInPt}pt`);
-                }
-                // Handle background color
-                if (charProps?.shadeColor && charProps.shadeColor !== "none" && charProps.shadeColor !== "#FFFFFF") {
-                    styleParts.push(`background-color:${this.normalizeColor(charProps.shadeColor)}`);
-                }
-                const styleAttr = styleParts.length ? ` style="${styleParts.join(";")}"` : "";
-                if (open || styleAttr) {
-                    html = `${open}<span${styleAttr}>${html}</span>${close}`;
+            const charPrIDRef = run?.["@charPrIDRef"];
+            if (charPrIDRef) {
+                const charPr = this.characterProperties.get(charPrIDRef);
+                if (charPr) {
+                    const styles = [];
+                    // Font size
+                    if (charPr.height) {
+                        const pts = this.convertHwpUnitToPoints(charPr.height);
+                        styles.push(`font-size:${pts}pt`);
+                    }
+                    // Text color
+                    if (charPr.textColor && charPr.textColor !== "none" && charPr.textColor !== "#000000") {
+                        styles.push(`color:${this.normalizeColor(charPr.textColor)}`);
+                    }
+                    // Background color
+                    if (charPr.shadeColor && charPr.shadeColor !== "none") {
+                        styles.push(`background-color:${this.normalizeColor(charPr.shadeColor)}`);
+                    }
+                    if (styles.length > 0 || charPr.bold || charPr.italic) {
+                        const opening = [];
+                        const closing = [];
+                        if (charPr.bold) {
+                            opening.push('<strong>');
+                            closing.unshift('</strong>');
+                        }
+                        if (charPr.italic) {
+                            opening.push('<em>');
+                            closing.unshift('</em>');
+                        }
+                        if (styles.length > 0) {
+                            opening.push(`<span style="${styles.join(';')}">`);
+                            closing.unshift('</span>');
+                        }
+                        html = opening.join('') + html + closing.join('');
+                    }
                 }
             }
         }
         return html;
     }
-    
-    findBinRefInRun(run) {
-        // common patterns - note: XML parser removes namespaces, so hp:pic becomes 'pic', hc:img becomes 'img'
-        const pic = run?.["hp:picture"] ?? run?.picture ?? run?.pic;
-        const draw = run?.["hp:draw"] ?? run?.draw;
-        const img = run?.["hp:img"] ?? run?.img;
-        const hcImg = run?.["hc:img"] ?? run?.["hp:hc:img"];
+    getBinaryRefFromObject(pic, draw, img, hcImg) {
+        // priority: picture → drawObject → img
         const tryExtract = (node) => {
             if (!node)
                 return undefined;
@@ -748,6 +818,9 @@ export class HwpxReader {
         // Clear existing definitions
         this.characterProperties.clear();
         this.fontFaces.clear();
+        this.paragraphProperties.clear();
+        this.numberings.clear();
+        
         // Find and parse header.xml
         const headerXml = this.getTextFile("Contents/header.xml");
         if (!headerXml)
@@ -787,12 +860,113 @@ export class HwpxReader {
                     }
                 }
             }
+            
+            // NEW: Parse numberings
+            const numberings = refList?.numberings;
+            if (numberings?.numbering) {
+                const numberingList = Array.isArray(numberings.numbering) ? numberings.numbering : [numberings.numbering];
+                for (const numbering of numberingList) {
+                    const id = numbering?.["@id"];
+                    if (id) {
+                        this.numberings.set(id, this.processNumbering(numbering));
+                    }
+                }
+            }
+            
+            // NEW: Parse paragraph properties from refList
+            const paraProperties = refList?.paraProperties;
+            if (paraProperties?.paraPr) {
+                const paraPrs = Array.isArray(paraProperties.paraPr) ? paraProperties.paraPr : [paraProperties.paraPr];
+                for (const paraPr of paraPrs) {
+                    const id = paraPr?.["@id"];
+                    if (id) {
+                        this.paragraphProperties.set(id, this.processParagraphProperties(paraPr));
+                    }
+                }
+            }
         }
         catch (error) {
             // Silent fail - styles are optional
             console.warn("Failed to parse style definitions:", error);
         }
     }
+    
+    // NEW: Process numbering definition
+    processNumbering(numbering) {
+        const paraHeads = numbering?.paraHead;
+        if (!paraHeads) return { paraHeads: [] };
+        
+        const heads = Array.isArray(paraHeads) ? paraHeads : [paraHeads];
+        const processed = heads.map(head => {
+            const level = parseInt(head?.["@level"] || "0", 10);
+            // The text content of paraHead is the bullet/number format
+            // It could be a symbol like "●", "○", "■" or a format string like "^1."
+            const text = typeof head === "string" ? head : 
+                         (head?.["#text"] || head?.text || "");
+            
+            return {
+                level: level,
+                text: text,
+                align: head?.["@align"],
+                numFormat: head?.["@numFormat"]
+            };
+        });
+        
+        return { paraHeads: processed };
+    }
+    
+    // NEW: Process paragraph properties
+    processParagraphProperties(paraPr) {
+        const heading = paraPr?.heading;
+        
+        // Extract indentation values from margin (handle hp:switch structure)
+        let indent = {};
+        
+        // The margin can be in different places:
+        // 1. Directly under paraPr
+        // 2. Inside hp:switch > hp:case
+        // 3. Inside hp:switch > hp:default
+        let margin = paraPr?.margin;
+        
+        // Check for switch structure
+        if (!margin && paraPr?.switch) {
+            const switchElem = paraPr.switch;
+            // Try case first, then default
+            margin = switchElem?.case?.margin || switchElem?.default?.margin;
+        }
+        
+        if (margin) {
+            // Check for hc:intent and hc:left in the margin
+            const intentElem = margin?.intent;
+            const leftElem = margin?.left;
+            
+            if (intentElem) {
+                const val = intentElem?.["@value"];
+                if (val) {
+                    indent.intent = parseInt(val, 10);
+                }
+            }
+            if (leftElem) {
+                const val = leftElem?.["@value"];
+                if (val) {
+                    indent.left = parseInt(val, 10);
+                }
+            }
+        }
+        
+        const result = { indent };
+        
+        if (heading) {
+            result.heading = {
+                type: heading?.["@type"],
+                idRef: heading?.["@idRef"],
+                level: parseInt(heading?.["@level"] || "0", 10)
+            };
+        }
+        
+        return result;
+    }
+    
     processCharacterProperties(charPr) {
         // Bold is indicated by presence of <hh:bold/> element (after namespace removal, becomes 'bold')
         const hasBold = charPr?.bold !== undefined;
