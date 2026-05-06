@@ -53,6 +53,7 @@ export class HwpxReader {
     // NEW: Add maps for paragraph properties and numberings
     paragraphProperties = new Map();
     numberings = new Map();
+    bullets = new Map(); // hh:bullet definitions: id → char
     
     async loadFromArrayBuffer(buffer) {
         const zip = await JSZip.loadAsync(buffer);
@@ -259,7 +260,9 @@ export class HwpxReader {
     // NEW: Extract text/spaces from a run element
     extractRunText(run) {
         if (!run) return "";
-        if (run?.secPr || run?.ctrl) return "";
+        // Skip runs that are purely section-property or ctrl containers with no content
+        if (run?.secPr && !run?.tbl && !run?.t && !run?.s) return "";
+        if (run?.ctrl && !run?.tbl && !run?.t && !run?.s) return "";
         
         const pieces = [];
         
@@ -281,19 +284,58 @@ export class HwpxReader {
             }
         }
         
-        // Handle space elements - <hp:s> represents spaces
+        // Handle space elements - <hp:s cnt="N"> represents N spaces
         const s = run?.s ?? run?.["hp:s"];
         if (s !== undefined && s !== null) {
-            if (Array.isArray(s)) {
-                for (let i = 0; i < s.length; i++) {
-                    pieces.push(" ");
-                }
-            } else {
-                pieces.push(" ");
+            const sArr = Array.isArray(s) ? s : [s];
+            for (const sElem of sArr) {
+                const cnt = (typeof sElem === "object" && sElem?.["@cnt"])
+                    ? Math.max(1, parseInt(sElem["@cnt"], 10) || 1)
+                    : 1;
+                pieces.push(" ".repeat(cnt));
+            }
+        }
+        
+        // Table embedded in run — extract cell text
+        const tblInRun = run?.tbl ?? run?.["hp:tbl"];
+        if (tblInRun) {
+            const tbls = Array.isArray(tblInRun) ? tblInRun : [tblInRun];
+            for (const tbl of tbls) {
+                pieces.push(this.extractTableText(tbl));
             }
         }
         
         return pieces.join("");
+    }
+    
+    // Extract plain text from a table node (traverses subList > p > run > t)
+    extractTableText(tbl) {
+        const rows = [];
+        const trs = tbl?.tr ?? tbl?.["hp:tr"];
+        const trArr = trs ? (Array.isArray(trs) ? trs : [trs]) : [];
+        for (const tr of trArr) {
+            const tcs = tr?.tc ?? tr?.["hp:tc"];
+            const tcArr = tcs ? (Array.isArray(tcs) ? tcs : [tcs]) : [];
+            const cellTexts = [];
+            for (const tc of tcArr) {
+                const subList = tc?.subList ?? tc?.["hp:subList"];
+                const sls = subList ? (Array.isArray(subList) ? subList : [subList]) : [];
+                const cellParts = [];
+                for (const sl of sls) {
+                    const ps = sl?.p ?? sl?.["hp:p"];
+                    const paras = ps ? (Array.isArray(ps) ? ps : [ps]) : [];
+                    for (const p of paras) {
+                        const runs = p?.run ?? p?.["hp:run"];
+                        const runArr = runs ? (Array.isArray(runs) ? runs : [runs]) : [];
+                        const paraText = runArr.map((r) => this.extractRunText(r)).join("");
+                        if (paraText) cellParts.push(paraText);
+                    }
+                }
+                cellTexts.push(cellParts.join("\n"));
+            }
+            rows.push(cellTexts.join("\t"));
+        }
+        return rows.join("\n");
     }
 
     async extractText(options) {
@@ -364,7 +406,7 @@ export class HwpxReader {
                 const runArr = Array.isArray(runs) ? runs : [runs];
                 const textPieces = [];
                 for (const run of runArr) {
-                    const runText = this.extractRunText(run);  // NEW: Use new method
+                    const runText = this.extractRunText(run);
                     if (runText) {
                         textPieces.push(runText);
                     }
@@ -402,7 +444,21 @@ export class HwpxReader {
         if (!paraPr) return null;
         
         const heading = paraPr.heading;
-        if (!heading || heading.type !== "NUMBER") return null;
+        if (!heading) return null;
+        
+        // BULLET type: character bullet (•, -, etc.) stored in hh:bullets
+        if (heading.type === "BULLET") {
+            const bulletChar = this.bullets.get(String(heading.idRef)) ?? "•";
+            if (!bulletChar) return null;
+            const indent = paraPr.indent || {};
+            return {
+                text: bulletChar,
+                indent: indent.intent || 0,
+                leftMargin: indent.left || 0
+            };
+        }
+        
+        if (heading.type !== "NUMBER") return null;
         
         const numberingId = heading.idRef;
         const level = heading.level || 0;
@@ -420,25 +476,19 @@ export class HwpxReader {
         const indentValue = indent.intent || 0;
         const leftValue = indent.left || 0;
         
-        // Process bullet/number text
+        // Process bullet/number text.
+        // Template has a ^N placeholder (e.g. "^1.", "^3)", "(^5)", "^7").
+        // N is the 1-based counter reference; the surrounding chars are prefix/suffix.
         let bulletText = paraHead.text || "";
         
-        // Handle ^N placeholder format - replace with actual counter
-        if (/^\^(\d+)\.?$/.test(bulletText)) {
-            // This is a numbered format like ^1.
+        if (bulletText.includes("^")) {
             const key = `${numberingId}-${level}`;
-            
-            // Initialize counter if needed
-            if (!numberingCounters[key]) {
-                numberingCounters[key] = 1;
-            }
-            
-            // Replace ^N with actual number
-            bulletText = bulletText.replace(/^\^(\d+)(\.?)$/, (match, num, dot) => {
-                return `${numberingCounters[key]}${dot}`;
-            });
-            
-            // Increment counter for next use
+            if (!numberingCounters[key]) numberingCounters[key] = 1;
+            const counter = numberingCounters[key];
+            const numFormat = paraHead.numFormat || "DIGIT";
+            const formatted = this.formatCounter(counter, numFormat);
+            // Replace first ^N (any digits) with formatted value
+            bulletText = bulletText.replace(/\^\d+/, formatted);
             numberingCounters[key]++;
         }
         
@@ -447,6 +497,60 @@ export class HwpxReader {
             indent: indentValue,
             leftMargin: leftValue
         };
+    }
+    
+    /** Convert an integer counter to the requested HWPX numFormat string. */
+    formatCounter(n, numFormat) {
+        switch (numFormat) {
+            case "HANGUL_SYLLABLE": {
+                // 가, 나, 다, 라, 마, 바, 사, 아, 자, 차, 카, 타, 파, 하
+                const syllables = ["가","나","다","라","마","바","사","아","자","차","카","타","파","하"];
+                return syllables[(n - 1) % syllables.length] || String(n);
+            }
+            case "LATIN_SMALL": {
+                // a, b, c, ..., z, aa, ab, ...
+                let s = ""; let x = n;
+                while (x > 0) { s = String.fromCharCode(96 + ((x - 1) % 26 + 1)) + s; x = Math.floor((x - 1) / 26); }
+                return s;
+            }
+            case "LATIN_LARGE": {
+                let s = ""; let x = n;
+                while (x > 0) { s = String.fromCharCode(64 + ((x - 1) % 26 + 1)) + s; x = Math.floor((x - 1) / 26); }
+                return s;
+            }
+            case "ROMAN_SMALL": {
+                const vals = [1000,900,500,400,100,90,50,40,10,9,5,4,1];
+                const syms = ["m","cm","d","cd","c","xc","l","xl","x","ix","v","iv","i"];
+                let r = ""; let x = n;
+                for (let i = 0; i < vals.length; i++) { while (x >= vals[i]) { r += syms[i]; x -= vals[i]; } }
+                return r;
+            }
+            case "ROMAN_LARGE": {
+                const vals = [1000,900,500,400,100,90,50,40,10,9,5,4,1];
+                const syms = ["M","CM","D","CD","C","XC","L","XL","X","IX","V","IV","I"];
+                let r = ""; let x = n;
+                for (let i = 0; i < vals.length; i++) { while (x >= vals[i]) { r += syms[i]; x -= vals[i]; } }
+                return r;
+            }
+            case "CIRCLED_DIGIT": {
+                // ①②③...⑳ then plain number
+                if (n >= 1 && n <= 20) return String.fromCharCode(0x2460 + n - 1);
+                return String(n);
+            }
+            case "CIRCLED_HANGUL_SYLLABLE": {
+                // ㉮㉯㉰... (U+326E+)
+                if (n >= 1 && n <= 14) return String.fromCharCode(0x326E + n - 1);
+                return String(n);
+            }
+            case "CIRCLED_LATIN_SMALL": {
+                // ⓐⓑⓒ... (U+24D0+)
+                if (n >= 1 && n <= 26) return String.fromCharCode(0x24D0 + n - 1);
+                return String(n);
+            }
+            case "DIGIT":
+            default:
+                return String(n);
+        }
     }
     
     async extractHtml(options) {
@@ -502,25 +606,26 @@ export class HwpxReader {
             if (ps) {
                 const paras = Array.isArray(ps) ? ps : [ps];
                 for (const p of paras) {
-                    // NEW: Check for bullet/numbering with indentation
+                    // Check for bullet/numbering with indentation
                     const bulletInfo = this.getBulletInfo(p, numberingCounters);
-                    const inner = this.renderNodeToHtml(p, { enableImages, enableStyles }, options);
+                    const inner = this.renderNodeToHtml(p, { enableImages, enableStyles, numberingCounters }, options);
                     const alignStyle = this.getAlignStyle(p);
                     
-                    // Build style attribute with indentation
+                    // Build style attribute
                     const styles = [];
                     if (alignStyle) styles.push(alignStyle);
                     
-                    if (bulletInfo) {
-                        // Convert HWPUNIT to points (1000 HWPUNIT ≈ 10pt)
-                        const leftMarginPt = Math.round(bulletInfo.leftMargin / 100);
-                        // const indentPt = Math.round(bulletInfo.indent / 100);
-                        
-                        // For visible bullet indentation: just use padding-left
-                        // Don't use negative text-indent as it cancels out the visual spacing
-                        if (leftMarginPt > 0) {
-                            styles.push(`padding-left:${leftMarginPt}pt`);
-                        }
+                    // Apply left-margin indentation from paraPr for ALL paragraphs.
+                    // This covers both bulleted lists (via getBulletInfo) and plain
+                    // indented paragraphs (type="NONE" with a non-zero hc:left value).
+                    const paraPrIDRef = p?.["@paraPrIDRef"];
+                    const paraPr = paraPrIDRef ? this.paragraphProperties.get(paraPrIDRef) : undefined;
+                    const leftHwpUnit = paraPr?.indent?.left ?? (bulletInfo ? bulletInfo.leftMargin : 0);
+                    if (leftHwpUnit > 0) {
+                        // 1 HWPUNIT = 1/7200 inch; 72pt per inch → 1 HWPUNIT ≈ 0.01pt
+                        // Practical formula: leftPt = leftHwpUnit / 100  (matches HWP screen rendering)
+                        const leftPt = Math.round(leftHwpUnit / 100);
+                        styles.push(`padding-left:${leftPt}pt`);
                     }
                     
                     const styleAttr = styles.length > 0 ? ` style="${styles.join(';')}"` : "";
@@ -530,39 +635,12 @@ export class HwpxReader {
                     pieces.push(`<${paragraphTag}${styleAttr}>${content}</${paragraphTag}>`);
                 }
             }
-            // minimal tables: hp:tbl > hp:tr > hp:tc (cells)
+            // Direct section-level tables (rare but possible in some HWPX variants)
             const tbls = section?.tbl ?? section?.["hp:tbl"];
             if (tbls && enableTables) {
-                const tableClass = options?.tableClassName ?? "hwpx-table";
                 const tables = Array.isArray(tbls) ? tbls : [tbls];
                 for (const tbl of tables) {
-                    const trs = tbl?.tr ?? tbl?.["hp:tr"];
-                    const rows = trs ? (Array.isArray(trs) ? trs : [trs]) : [];
-                    const rowHtml = [];
-                    rows.forEach((tr, rowIndex) => {
-                        const tcs = tr?.tc ?? tr?.["hp:tc"];
-                        const cells = tcs ? (Array.isArray(tcs) ? tcs : [tcs]) : [];
-                        const cellHtml = [];
-                        for (const tc of cells) {
-                            // cell may contain paragraphs/runs
-                            const inner = this.renderNodeToHtml(tc, { enableImages, enableStyles }, options);
-                            const colSpan = tc?.["@colSpan"] ?? tc?.["@colspan"] ?? tc?.["@gridSpan"];
-                            const rowSpan = tc?.["@rowSpan"] ?? tc?.["@rowspan"];
-                            const alignStyle = this.getAlignStyle(tc);
-                            const attrs = [];
-                            if (colSpan && String(colSpan) !== "1")
-                                attrs.push(` colspan=\"${String(colSpan)}\"`);
-                            if (rowSpan && String(rowSpan) !== "1")
-                                attrs.push(` rowspan=\"${String(rowSpan)}\"`);
-                            if (alignStyle)
-                                attrs.push(` style=\"${alignStyle}\"`);
-                            const isHeader = options?.tableHeaderFirstRow && rowIndex === 0;
-                            const tag = isHeader ? "th" : "td";
-                            cellHtml.push(`<${tag}${attrs.join("")}>${inner}</${tag}>`);
-                        }
-                        rowHtml.push(`<tr>${cellHtml.join("")}</tr>`);
-                    });
-                    pieces.push(`<table class="${tableClass}">${rowHtml.join("")}</table>`);
+                    pieces.push(this.renderTableToHtml(tbl, { enableImages, enableStyles, enableTables }, options));
                 }
             }
         }
@@ -581,6 +659,48 @@ export class HwpxReader {
         }
         return html;
     }
+    /**
+     * Render a single hp:tbl node to HTML.
+     * Handles both direct-child tables and run-embedded tables.
+     * Cell content lives in hp:tc > hp:subList > hp:p (NOT directly in hp:tc).
+     * Span info lives in hp:tc > hp:cellSpan[@colSpan/@rowSpan] child element.
+     */
+    renderTableToHtml(tbl, flags, options) {
+        const tableClass = options?.tableClassName ?? "hwpx-table";
+        const trs = tbl?.tr ?? tbl?.["hp:tr"];
+        const rows = trs ? (Array.isArray(trs) ? trs : [trs]) : [];
+        const rowHtml = [];
+        rows.forEach((tr, rowIndex) => {
+            const tcs = tr?.tc ?? tr?.["hp:tc"];
+            const cells = tcs ? (Array.isArray(tcs) ? tcs : [tcs]) : [];
+            const cellHtml = [];
+            for (const tc of cells) {
+                // Cell content is inside hp:subList, not directly inside hp:tc
+                const inner = this.renderNodeToHtml(tc, flags, options);
+                // Span info lives in child element hp:cellSpan, not as direct tc attributes
+                const cellSpan = tc?.cellSpan ?? tc?.["hp:cellSpan"];
+                const colSpan = cellSpan?.["@colSpan"] ?? cellSpan?.["@colspan"]
+                    ?? tc?.["@colSpan"] ?? tc?.["@colspan"] ?? tc?.["@gridSpan"];
+                const rowSpan = cellSpan?.["@rowSpan"] ?? cellSpan?.["@rowspan"]
+                    ?? tc?.["@rowSpan"] ?? tc?.["@rowspan"];
+                const subList = tc?.subList ?? tc?.["hp:subList"];
+                const sl = Array.isArray(subList) ? subList[0] : subList;
+                const alignStyle = this.getAlignStyle(sl) || this.getAlignStyle(tc);
+                const attrs = [];
+                if (colSpan && String(colSpan) !== "1")
+                    attrs.push(` colspan="${String(colSpan)}"`);
+                if (rowSpan && String(rowSpan) !== "1")
+                    attrs.push(` rowspan="${String(rowSpan)}"`);
+                if (alignStyle)
+                    attrs.push(` style="${alignStyle}"`);
+                const isHeader = options?.tableHeaderFirstRow && rowIndex === 0;
+                const tag = isHeader ? "th" : "td";
+                cellHtml.push(`<${tag}${attrs.join("")}>${inner}</${tag}>`);
+            }
+            rowHtml.push(`<tr>${cellHtml.join("")}</tr>`);
+        });
+        return `<table class="${tableClass}">${rowHtml.join("")}</table>`;
+    }
     getAlignStyle(node) {
         const a = node?.["@align"] ?? node?.["@textAlign"] ?? node?.paraPr?.["@align"] ?? node?.cellPr?.["@align"];
         if (typeof a !== "string")
@@ -594,11 +714,32 @@ export class HwpxReader {
     renderNodeToHtml(node, flags, options) {
         if (!node)
             return "";
-        // paragraph aggregation
+        // subList: HWPX table-cell content container — must be checked before p/run
+        const subList = node?.["hp:subList"] ?? node?.subList;
+        if (subList) {
+            const sls = Array.isArray(subList) ? subList : [subList];
+            return sls.map((sl) => this.renderNodeToHtml(sl, flags, options)).join("\n");
+        }
+        // paragraph aggregation — each <hp:p> in a cell becomes its own <p> so
+        // paragraph breaks are visible in HTML (a bare "\n" join is invisible).
         const ps = node?.["hp:p"] ?? node?.p;
         if (ps) {
             const paras = Array.isArray(ps) ? ps : [ps];
-            return paras.map((p) => this.renderNodeToHtml(p, flags, options)).join("\n");
+            // numberingCounters flows through flags so sequential bullets stay in sync
+            const counters = flags?.numberingCounters ?? {};
+            return paras.map((p) => {
+                const bulletInfo = this.getBulletInfo(p, counters);
+                const inner = this.renderNodeToHtml(p, { ...flags, numberingCounters: counters }, options);
+                // Carry per-paragraph left-indent; prefer paraPr, fall back to bulletInfo
+                const paraPrIDRef = p?.["@paraPrIDRef"];
+                const paraPr = paraPrIDRef ? this.paragraphProperties.get(paraPrIDRef) : undefined;
+                const leftHwpUnit = paraPr?.indent?.left ?? (bulletInfo ? bulletInfo.leftMargin : 0);
+                const styleAttr = leftHwpUnit > 0
+                    ? ` style="padding-left:${Math.round(leftHwpUnit / 100)}pt"`
+                    : "";
+                const content = bulletInfo ? `${bulletInfo.text} ${inner}` : inner;
+                return `<p${styleAttr}>${content}</p>`;
+            }).join("");
         }
         // runs
         const runs = node?.["hp:run"] ?? node?.run;
@@ -646,8 +787,11 @@ export class HwpxReader {
     }
     
     renderRunToHtml(run, flags, options) {
-        // 섹션 설정이나 컨트롤 정보가 있는 run은 건너뛰기
-        if (run?.secPr || run?.ctrl)
+        // Skip runs that are ONLY section-property containers
+        if (run?.secPr && !run?.tbl && !run?.t && !run?.s)
+            return "";
+        // Skip ctrl-only runs (column layout, page numbers, etc.) — but NOT if they also carry a tbl
+        if (run?.ctrl && !run?.tbl && !run?.t && !run?.s)
             return "";
         
         // Collect text and spaces from run
@@ -671,15 +815,15 @@ export class HwpxReader {
             }
         }
         
-        // Handle space elements
+        // Handle space elements — <hp:s cnt="N"> means N spaces
         const s = run?.s ?? run?.["hp:s"];
         if (s !== undefined && s !== null) {
-            if (Array.isArray(s)) {
-                for (let i = 0; i < s.length; i++) {
-                    html += " ";
-                }
-            } else {
-                html += " ";
+            const sArr = Array.isArray(s) ? s : [s];
+            for (const sElem of sArr) {
+                const cnt = (typeof sElem === "object" && sElem?.["@cnt"])
+                    ? Math.max(1, parseInt(sElem["@cnt"], 10) || 1)
+                    : 1;
+                html += "\u00a0".repeat(cnt); // &nbsp; preserves multiple spaces in HTML
             }
         }
         
@@ -698,6 +842,14 @@ export class HwpxReader {
                     const b64 = this.toBase64(imgBytes);
                     html += `<img src="data:${mime};base64,${b64}" alt="Image" style="max-width:100%;"/>`;
                 }
+            }
+        }
+        // Table embedded directly inside a run (most common HWPX pattern)
+        if (flags.enableTables !== false) {
+            const tblInRun = run?.tbl ?? run?.["hp:tbl"];
+            if (tblInRun) {
+                const tbls = Array.isArray(tblInRun) ? tblInRun : [tblInRun];
+                html += tbls.map((t) => this.renderTableToHtml(t, flags, options)).join("");
             }
         }
         // Apply character style
@@ -820,6 +972,7 @@ export class HwpxReader {
         this.fontFaces.clear();
         this.paragraphProperties.clear();
         this.numberings.clear();
+        this.bullets.clear();
         
         // Find and parse header.xml
         const headerXml = this.getTextFile("Contents/header.xml");
@@ -870,6 +1023,17 @@ export class HwpxReader {
                     if (id) {
                         this.numberings.set(id, this.processNumbering(numbering));
                     }
+                }
+            }
+            
+            // Parse bullet definitions: hh:bullets > hh:bullet[@id, @char]
+            const bulletsNode = refList?.bullets;
+            if (bulletsNode?.bullet) {
+                const bulletList = Array.isArray(bulletsNode.bullet) ? bulletsNode.bullet : [bulletsNode.bullet];
+                for (const b of bulletList) {
+                    const id = b?.["@id"];
+                    const char = b?.["@char"] ?? "";
+                    if (id !== undefined) this.bullets.set(String(id), char);
                 }
             }
             
@@ -1011,6 +1175,12 @@ export class HwpxReader {
     extractTextFromNode(node) {
         if (!node)
             return "";
+        // subList: table-cell content container — check before p/run
+        const subList = node?.["hp:subList"] ?? node?.subList;
+        if (subList) {
+            const sls = Array.isArray(subList) ? subList : [subList];
+            return sls.map((sl) => this.extractTextFromNode(sl)).join("\n");
+        }
         // hp:p → hp:run → hp:t
         const ps = node?.["hp:p"] ?? node?.p;
         if (ps) {
@@ -1021,7 +1191,7 @@ export class HwpxReader {
         const runArr = runs ? (Array.isArray(runs) ? runs : [runs]) : [];
         const textPieces = [];
         for (const run of runArr) {
-            const runText = this.extractRunText(run);  // NEW: Use new method
+            const runText = this.extractRunText(run);
             if (runText) {
                 textPieces.push(runText);
             }
