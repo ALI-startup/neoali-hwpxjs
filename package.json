@@ -1,6 +1,6 @@
 {
   "name": "neoali-hwpxjs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "HWPX to HTML converter with Pandoc-compatible spacing fixes",
   "license": "MIT",
   "type": "module",
