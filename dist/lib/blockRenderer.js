@@ -200,7 +200,7 @@ export function renderTableToHtml(tbl, flags, options, ctx) {
         tableBody += `<tbody>${bodyRows.join("")}</tbody>`;
     }
 
-    return `<table class="${tableClass}">${tableBody}</table>`;
+    return `<table class="${tableClass}" style="border-collapse:collapse;border-spacing:0">${tableBody}</table>`;
 }
 
 // ─── Public: extract table plain text ────────────────────────────────────────
